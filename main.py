@@ -2,6 +2,8 @@ import argparse
 import sys
 import json
 import hashlib
+import time
+from typing import List, Tuple
 import zlib
 from pathlib import Path 
 
@@ -35,7 +37,107 @@ class Blob(GitObject):
     def __init__(self, content: bytes):
         super().__init__("blob", content)
 
+class Tree(GitObject):
+    def __init__(self, entries: List[Tuple[str, str, str]] = None):
+        self.entries = entries or []
+        content = self._serialize_entries()
+        super().__init__("tree", content)
 
+    def _serialize_entries(self) -> bytes:
+        # 100644 <name>\0<hash><mode> <name>\0<hash><mode> <name>\0<hash><mode> <name>\0<hash>
+        content = b""
+        for mode, name, obj_hash in sorted(self.entries):
+            content += f"{mode} {name}\0".encode()
+            content += bytes.fromhex(obj_hash)
+
+        return content
+
+    def add_entry(self, mode: str, name: str, obj_hash: str):
+        self.entries.append((mode, name, obj_hash))
+        self.content = self._serialize_entries()
+
+    @classmethod
+    def from_content(cls, content: bytes) -> Tree:
+        tree = cls()
+        i = 0
+
+        while i < len(content):
+            null_idx = content.find(b"\0", i)
+            if null_idx == -1:
+                break
+
+            mode_name = content[i:null_idx].decode()
+            mode, name = mode_name.split(" ", 1)
+            obj_hash = content[null_idx + 1 : null_idx + 21].hex()
+            tree.entries.append((mode, name, obj_hash))
+
+            i = null_idx + 21
+
+        return tree
+
+
+class Commit(GitObject):
+    def __init__(
+        self,
+        tree_hash: str,
+        parent_hashes: List[str],
+        author: str,
+        committer: str,
+        message: str,
+        timestamp: int = None,
+    ):
+        self.tree_hash = tree_hash
+        self.parent_hashes = parent_hashes
+        self.author = author
+        self.committer = committer
+        self.message = message
+        self.timestamp = timestamp or int(time.time())
+
+        content = self._serialize_commit()
+        super().__init__("commit", content)
+
+
+    def _serialize_commit(self):
+        lines = [f"tree {self.tree_hash}"]
+        for parent in self.parent_hashes:
+            lines.append(f"parent {parent}")
+
+        lines.append(f"author {self.author} {self.timestamp} +0000")
+        lines.append(f"committer {self.committer} {self.timestamp} +0000")
+        lines.append("")
+        lines.append(self.message)
+
+        return "\n".join(lines).encode()
+
+    @classmethod
+    def from_content(cls, content: bytes) -> Commit:
+        lines = content.decode().split("\n")
+        tree_hash = None
+        parent_hashes = []
+        author = None
+        committer = None
+        message_start = 0
+
+        for i, line in enumerate(lines):
+            if line.startswith("tree "):
+                tree_hash = line[5:]
+            elif line.startswith("parent "):
+                parent_hashes.append(line[7:])
+            elif line.startswith("author "):
+                author_parts = line[7:].rsplit(" ", 2)
+                author = author_parts[0]
+                timestamp = int(author_parts[1])
+            elif line.startswith("committer "):
+                committer_parts = line[10:].rsplit(" ", 2)
+                committer = committer_parts[0]
+            elif line == "":
+                message_start = i + 1
+                break
+
+        message = "\n".join(lines[message_start:])
+        commit = cls(tree_hash, parent_hashes, author, committer, message, timestamp)
+        return commit      
+    
 class Repository:
     def __init__(self, path="."):
         self.path = Path(path).resolve()
@@ -167,6 +269,129 @@ class Repository:
         else:
             raise ValueError(f"{path} is neither a file nor a directory")
 
+    def load_object(self, obj_hash: str) -> GitObject:
+            obj_dir = self.objects_dir / obj_hash[:2]
+            obj_file = obj_dir / obj_hash[2:]
+
+            if not obj_file.exists():
+                raise FileNotFoundError(f"Object {obj_hash} not found")
+
+            return GitObject.deserialize(obj_file.read_bytes())
+
+
+    def create_tree_from_index(self):
+        index = self.load_index()
+        if not index:
+            tree = Tree()
+            return self.store_object(tree)
+
+        dirs = {}
+        files = {}
+
+        for file_path, blob_hash in index.items():
+            parts = file_path.split("/")
+
+            if len(parts) == 1:
+                # file in root
+                files[parts[0]] = blob_hash
+            else:
+                dir_name = parts[0]
+                if dir_name not in dirs:
+                    dirs[dir_name] = {}
+
+                current = dirs[dir_name]
+                for part in parts[1:-1]:
+                    if part not in current:
+                        current[part] = {}
+
+                    current = current[part]
+
+                current[parts[-1]] = blob_hash
+
+        def create_tree_recursive(entries_dict: Dict):
+            tree = Tree()
+
+            for name, blob_hash in entries_dict.items():
+                if isinstance(blob_hash, str):
+                    tree.add_entry("100644", name, blob_hash)
+
+                if isinstance(blob_hash, dict):
+                    subtree_hash = create_tree_recursive(blob_hash)
+                    tree.add_entry("40000", name, subtree_hash)
+
+            return self.store_object(tree)
+
+
+        root_entries = {**files}
+        for dir_name, dir_contents in dirs.items():
+            root_entries[dir_name] = dir_contents
+
+        return create_tree_recursive(root_entries)            
+
+    def get_current_branch(self) -> str:
+        if not self.head_file.exists():
+            return "sensei"
+
+        head_content = self.head_file.read_text().strip()
+        if head_content.startswith("ref: refs/heads/"):
+            return head_content[16:]
+
+        return "HEAD"  # detached HEAD
+    
+
+    def get_branch_commit(self, current_branch: str):
+        branch_file = self.heads_dir / current_branch
+
+        if branch_file.exists():
+            return branch_file.read_text().strip()
+
+        return None
+    
+
+    def set_branch_commit(self, current_branch: str, commit_hash: str):
+        branch_file = self.heads_dir / current_branch
+        branch_file.write_text(commit_hash + "\n")
+
+
+    def commit(self, message: str, author: str = "Pygit User <user@pygit.com>"):
+        # create a tree object from the index (staging area)
+        tree_hash = self.create_tree_from_index()
+
+        current_branch = self.get_current_branch()
+        parent_commit = self.get_branch_commit(current_branch)
+        parent_hashes = [parent_hashes] if parent_commit else []
+
+        index = self.load_index()
+        if not index:
+            print("nothing to commit,  working tree clean")
+            return None
+        
+
+        if parent_commit:
+            parent_git_commit_obj = self.load_object(parent_commit)
+            parent_commit_data = Commit.from_content(parent_git_commit_obj.content)
+            if tree_hash == parent_commit_data.tree_hash:
+                print("nothing to commit, working tree clean")
+                return None            
+
+
+        commit = Commit(
+            tree_hash=tree_hash,
+            parent_hashes=parent_hashes,
+            author=author,
+            committer=author,
+            message=message,
+        )
+
+        commit_hash = self.store_object(commit)
+
+        self.set_branch_commit(current_branch, commit_hash)
+        self.save_index({})
+        print(f"Created commit {commit_hash} on branch {current_branch}")
+        return commit_hash
+
+        
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -184,11 +409,16 @@ def main():
     init_parser = subparsers.add_parser("init", help="Initialize a new repository")
 
 
-    #init command
+    #add command
     add_parser = subparsers.add_parser("add", help="Add files and Directories to the staging area")
-
     add_parser.add_argument("paths", nargs="+", help="Files and Directories to add")
+
+    # commit command
+    commit_parser = subparsers.add_parser("commit", help="Commit changes to the repository")
+    commit_parser.add_argument("-m", "--message", required=True, help="Commit message")    
+    commit_parser.add_argument("--author", help="Author name and email")    
     
+
     args = parser.parse_args()
 
     if not args.command:
@@ -207,6 +437,12 @@ def main():
                 return
             for path in args.paths:
                 repo.add_path(path)
+        elif args.command == "commit":
+            if not repo.git_dir.exists():
+                print("Not a git directory")
+                return
+            author = args.author or "PyGit user <user@pygit.com>"
+            repo.commit(args.message, author)
     except Exception as e:
         print(f"Error: {e}") 
         sys.exit(1)
