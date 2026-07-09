@@ -3,7 +3,7 @@ import sys
 import json
 import hashlib
 import time
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 import zlib
 from pathlib import Path 
 
@@ -235,7 +235,7 @@ class Repository:
         # recursively traverse the directory
         for file_path in full_path.rglob("*"):
             if file_path.is_file():
-                if ".mygit" in file_path.parts:
+                if ".mygit" in file_path.parts or ".git" in file_path.parts:
                     continue
 
                 # create & store blob object
@@ -359,7 +359,7 @@ class Repository:
 
         current_branch = self.get_current_branch()
         parent_commit = self.get_branch_commit(current_branch)
-        parent_hashes = [parent_hashes] if parent_commit else []
+        parent_hashes = [parent_commit] if parent_commit else []
 
         index = self.load_index()
         if not index:
